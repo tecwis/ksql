@@ -25,6 +25,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Random;
+import java.util.List;
+import java.util.LinkedList;
 
 import io.confluent.avro.random.generator.Generator;
 import io.confluent.ksql.util.KsqlConfig;
@@ -49,13 +51,6 @@ public class DataGen {
       usage(0);
     }
 
-    Generator generator;
-    try {
-      generator = new Generator(arguments.schemaFile, new Random());
-    } catch (IOException exception) {
-      System.err.printf("IOException encountered: %s%n", exception.getMessage());
-      return;
-    }
     DataGenProducer dataProducer;
 
     switch (arguments.format) {
@@ -81,22 +76,67 @@ public class DataGen {
         return;
     }
 
-    Properties props = new Properties();
-    props.put("bootstrap.servers", arguments.bootstrapServer);
-    props.put("client.id", "KSQLDataGenProducer");
-
-    try {
-      if (arguments.propertiesFile != null) {
-        props.load(arguments.propertiesFile);
+    long start = System.currentTimeMillis();
+    String schema = "";
+    while (true) {
+      byte[] b = new byte[256];
+      int ret;
+      try {
+        ret = arguments.schemaFile.read(b);
+      } catch (IOException exception) {
+        System.err.printf("IOException encountered: %s%n", exception.getMessage());
+        return;
       }
-    } catch (IOException exception) {
-      System.err.printf("IOException encountered: %s%n", exception.getMessage());
-      return;
+      if (ret < 0) {
+        break;
+      }
+      schema += new String(b);
     }
 
-    dataProducer.populateTopic(props, generator, arguments.topicName, arguments.keyName,
-                               arguments.iterations, arguments.maxInterval
-    );
+    List<Thread> threads = new LinkedList<>();
+    for (int i = 0; i < arguments.numThreads; i++) {
+      Properties props = arguments.properties;
+      props.put("bootstrap.servers", arguments.bootstrapServer);
+      props.put("client.id", "KSQLDataGenProducer");
+      System.out.println("Producer Properties:" + props);
+
+      try {
+        if (arguments.propertiesFile != null) {
+          props.load(arguments.propertiesFile);
+        }
+      } catch (IOException exception) {
+        System.err.printf("IOException encountered: %s%n", exception.getMessage());
+        return;
+      }
+
+      final TimestampGenerator timestampGenerator;
+      if (arguments.timeIncrement > 0) {
+        timestampGenerator = new TimestampGenerator(
+            start, arguments.timeIncrement, arguments.timeBurst);
+      } else {
+        timestampGenerator = null;
+      }
+
+      final Generator generator;
+      generator = new Generator(schema, new Random());
+
+      Thread t = new Thread(() -> {
+        dataProducer.populateTopic(props, generator, arguments.topicName, arguments.keyName,
+            arguments.iterations, arguments.maxInterval, arguments.printRows, timestampGenerator);
+      });
+      t.setDaemon(true);
+      t.start();
+      threads.add(t);
+    }
+
+    for (Thread t : threads) {
+      try {
+        t.join();
+      } catch (InterruptedException e) {
+        // interrupted. exit with error
+        System.exit(1);
+      }
+    }
   }
 
   private static void usage() {
@@ -134,7 +174,12 @@ public class DataGen {
     public final int iterations;
     public final long maxInterval;
     public final String schemaRegistryUrl;
+    public final boolean printRows;
+    public final Properties properties;
+    public final int numThreads;
     public final InputStream propertiesFile;
+    public final long timeIncrement;
+    public final long timeBurst;
 
     public Arguments(
         boolean help,
@@ -146,7 +191,12 @@ public class DataGen {
         int iterations,
         long maxInterval,
         String schemaRegistryUrl,
-        InputStream propertiesFile
+        boolean printRows,
+        Properties properties,
+        int numThreads,
+        InputStream propertiesFile,
+        long timeIncrement,
+        long timeBurst
     ) {
       this.help = help;
       this.bootstrapServer = bootstrapServer;
@@ -157,7 +207,12 @@ public class DataGen {
       this.iterations = iterations;
       this.maxInterval = maxInterval;
       this.schemaRegistryUrl = schemaRegistryUrl;
+      this.printRows = printRows;
+      this.properties = properties;
+      this.numThreads = numThreads;
       this.propertiesFile = propertiesFile;
+      this.timeIncrement = timeIncrement;
+      this.timeBurst = timeBurst;
     }
 
     public static class ArgumentParseException extends RuntimeException {
@@ -180,7 +235,12 @@ public class DataGen {
       private int iterations;
       private long maxInterval;
       private String schemaRegistryUrl;
+      private boolean printRows;
+      private Properties properties;
+      private int numThreads;
       private InputStream propertiesFile;
+      private long timeIncrement;
+      private long timeBurst;
 
       public Builder() {
         quickstart = null;
@@ -193,7 +253,12 @@ public class DataGen {
         iterations = 1000000;
         maxInterval = -1;
         schemaRegistryUrl = "http://localhost:8081";
+        printRows = true;
+        properties = new Properties();
+        numThreads = 1;
         propertiesFile = null;
+        timeIncrement = -1;
+        timeBurst = 1;
       }
 
       private enum Quickstart {
@@ -236,7 +301,9 @@ public class DataGen {
 
       public Arguments build() {
         if (help) {
-          return new Arguments(true, null, null, null, null, null, 0, -1, null, null);
+          return new Arguments(true, null, null, null, null,
+              null, 0, -1, null, true, null,
+              1, null, -1, -1);
         }
 
         if (quickstart != null) {
@@ -264,7 +331,12 @@ public class DataGen {
             iterations,
             maxInterval,
             schemaRegistryUrl,
-            propertiesFile
+            printRows,
+            properties,
+            numThreads,
+            propertiesFile,
+            timeIncrement,
+            timeBurst
         );
       }
 
@@ -307,6 +379,13 @@ public class DataGen {
           ));
         }
 
+        if (argName.startsWith("producer")) {
+          String property = argName.substring("producer".length() + 1);
+          Object value = parsePropertyValue(argValue);
+          properties.put(property, value);
+          return this;
+        }
+
         switch (argName) {
           case "quickstart":
             try {
@@ -339,13 +418,25 @@ public class DataGen {
             iterations = parseIterations(argValue);
             break;
           case "maxInterval":
-            maxInterval = parseIterations(argValue);
+            maxInterval = parseMaxInterval(argValue);
             break;
           case "schemaRegistryUrl":
             schemaRegistryUrl = argValue;
             break;
+          case "printRows":
+            printRows = parsePrintRows(argValue);
+            break;
+          case "numThreads":
+            numThreads = parseNThreads(argValue);
+            break;
           case "propertiesFile":
             propertiesFile = new FileInputStream(argValue);
+            break;
+          case "timeIncrement":
+            timeIncrement = parseTimeIncrement(argValue);
+            break;
+          case "timeBurst":
+            timeBurst = parseTimeBurst(argValue);
             break;
           default:
             throw new ArgumentParseException(String.format(
@@ -386,10 +477,58 @@ public class DataGen {
         }
       }
 
+      private int parseNThreads(String numThreadsString) {
+        try {
+          int result = Integer.valueOf(numThreadsString, 10);
+          if (result < 0) {
+            throw new ArgumentParseException(String.format(
+                "Invalid number of threads in '%d'; must be a positive number",
+                result));
+          }
+          return result;
+        } catch (NumberFormatException e) {
+          throw new ArgumentParseException(String.format(
+              "Invalid number of threads in '%s'; must be a positive number",
+              numThreadsString));
+        }
+      }
+
+      private int parseTimeIncrement(String timeIncrementString) {
+        try {
+          int result = Integer.valueOf(timeIncrementString, 10);
+          if (result < 0) {
+            throw new ArgumentParseException(String.format(
+                "Invalid time increment in '%d'; must be a positive number",
+                result));
+          }
+          return result;
+        } catch (NumberFormatException e) {
+          throw new ArgumentParseException(String.format(
+              "Invalid time increment in '%s'; must be a positive number",
+              timeIncrementString));
+        }
+      }
+
+      private int parseTimeBurst(String timeBurstString) {
+        try {
+          int result = Integer.valueOf(timeBurstString, 10);
+          if (result < 0) {
+            throw new ArgumentParseException(String.format(
+                "Invalid time burst in '%d'; must be a positive number",
+                result));
+          }
+          return result;
+        } catch (NumberFormatException e) {
+          throw new ArgumentParseException(String.format(
+              "Invalid time burst in '%s'; must be a positive number",
+              timeBurstString));
+        }
+      }
+
       private long parseMaxInterval(String maxIntervalString) {
         try {
           long result = Long.valueOf(maxIntervalString, 10);
-          if (result <= 0) {
+          if (result < 0) {
             throw new ArgumentParseException(String.format(
                 "Invalid number of maxInterval in '%d'; must be a positive number",
                 result
@@ -401,6 +540,39 @@ public class DataGen {
               "Invalid number of maxInterval in '%s'; must be a valid base 10 long",
               maxIntervalString
           ));
+        }
+      }
+
+      private boolean parsePrintRows(String printRowsString) {
+        switch(printRowsString.toLowerCase()) {
+          case "false":
+            return false;
+          case "true":
+            return true;
+          default:
+            throw new ArgumentParseException(String.format(
+                "Invalid value for printRows in '%s'; must be true or false",
+                printRowsString
+            ));
+        }
+      }
+
+      private Object parsePropertyValue(String propertyValueString) {
+        String[] split = propertyValueString.split(",", 2);
+        if (split.length != 2) {
+          throw new ArgumentParseException(String.format(
+              "Invalid value for property in %s; must be in format <type>,<value>",
+              propertyValueString));
+        }
+        switch(split[0]) {
+          case "int":
+            return Integer.valueOf(split[1]);
+          case "string":
+            return split[1];
+          default:
+            throw new ArgumentParseException(String.format(
+                "Invalid type for property in %s; must be string or int",
+                propertyValueString));
         }
       }
     }

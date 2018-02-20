@@ -49,7 +49,9 @@ public abstract class DataGenProducer {
       String kafkaTopicName,
       String key,
       int messageCount,
-      long maxInterval
+      long maxInterval,
+      boolean printRows,
+      TimestampGenerator timestampGenerator
   ) {
     if (maxInterval < 0) {
       maxInterval = INTER_MESSAGE_MAX_INTERVAL;
@@ -129,17 +131,31 @@ public abstract class DataGenProducer {
 
       String keyString = randomAvroMessage.get(key).toString();
 
-      ProducerRecord<String, GenericRow> producerRecord = new ProducerRecord<>(
-          kafkaTopicName,
-          keyString,
-          genericRow
-      );
+      ProducerRecord<String, GenericRow> producerRecord;
+      if (timestampGenerator == null) {
+        producerRecord = new ProducerRecord<>(
+            kafkaTopicName,
+            keyString,
+            genericRow
+        );
+      } else {
+        producerRecord = new ProducerRecord<>(
+            kafkaTopicName,
+            null,
+            timestampGenerator.next(),
+            keyString,
+            genericRow);
+      }
       producer.send(producerRecord);
-      System.err.println(keyString + " --> (" + genericRow + ")");
-      try {
-        Thread.sleep((long) (maxInterval * Math.random()));
-      } catch (InterruptedException e) {
-        // Ignore the exception.
+      if (printRows) {
+        System.err.println(keyString + " --> (" + genericRow + ")");
+      }
+      if (maxInterval > 0) {
+        try {
+          Thread.sleep((long) (maxInterval * Math.random()));
+        } catch (InterruptedException e) {
+          // Ignore the exception.
+        }
       }
     }
     producer.flush();
