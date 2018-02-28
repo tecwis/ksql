@@ -80,6 +80,4 @@ interface MetricCollector extends ConsumerInterceptor, ProducerInterceptor {
   default double totalBytesConsumption() {
     return 0;
   }
-
-  default Map<String, Double> totalMessageConsumptionByTopic() { return null; }
 }
